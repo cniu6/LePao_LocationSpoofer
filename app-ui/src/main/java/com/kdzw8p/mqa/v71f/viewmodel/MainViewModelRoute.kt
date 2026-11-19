@@ -325,11 +325,12 @@ private fun MainViewModel.startSimulationWithPoints(
     targetKm: Double = 0.0
 ) {
     val startPoint = pointsToRun.first()
-    // 一键跑/批量跑传入账号目标公里：饱和目标取 1.5×，与宿主 LepaoAutoStop 的打卡续跑上限对齐，
-    // 让打卡不齐时模拟仍能继续移动到 1.5× 而不是在目标处冻死。手动模拟 targetKm=0 → 清快照，
-    // ConfigManager 回退到面板 lepao_auto_stop_km，避免继承上一次自动化的陈旧目标。
+    // 一键跑/批量跑传入账号目标公里：饱和上限取 3×，给乐跑 UI 里程留出到达目标的余量——模拟计程
+    // 早于乐跑开跑倒计时（头程偏差）且受 GPS 滤波影响，UI 里程落后于模拟行程，上限太小会让模拟
+    // 先饱和而 UI 仍未达标。宿主以 UI 里程为权威到点依据，模拟饱和仅作兜底。手动模拟 targetKm=0
+    // → 清快照，ConfigManager 回退到面板 lepao_auto_stop_km，避免继承上一次自动化的陈旧目标。
     com.kdzw8p.mqa.v71f.data.state.SpoofingState.targetDistanceM =
-        if (targetKm > 0.0) targetKm * 1000.0 * 1.5 else 0.0
+        if (targetKm > 0.0) targetKm * 1000.0 * 3.0 else 0.0
 
     _uiState.update {
         it.copy(

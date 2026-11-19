@@ -122,23 +122,19 @@ internal object LepaoAutoStop {
         // 自动结束会一直不触发；统一走全窗口根视图。
         val distance = (findByAllRoots(DISTANCE_ID) as? TextView)
             ?.text?.toString()?.trim()?.toDoubleOrNull() ?: return
-        // 模拟层在目标距离处已经把速度归零（位置停住但继续上报），乐跑自己累加的里程会停在
-        // 阈值下方；如果只等它凑够，计时会在原地空转，平均配速被拖成「速度过慢」。
-        // 模块自己的行程（含 offset、到目标饱和）才是准的：两边任一到达就触发。
+        // 到点判定以乐跑 UI 里程为权威（它就是乐跑实际累计、将提交的里程）。模拟行程从「开始 spoof」
+        // 就计程，早于乐跑开跑倒计时，带头程偏差且受乐跑 GPS 滤波影响，始终领先 UI——不能单独作为
+        // 到点依据，否则会提前停在 UI 未达标处（里程不足）。模拟行程仅在「已饱和到上限、无法再前进」
+        // 时兜底触发，避免模拟停住后 UI 永远凑不够阈值的死等。
         val simulated = if (cfg == null) null else runCatching {
             com.kdzw8p.mqa.v71f.xposed.utils.RouteEngine.traveledMeters(cfg)
         }.getOrNull()
-        // 防御：模拟饱和目标低于停止阈值说明双源失配（快照未下发），打日志暴露而非静默死等。
-        if (cfg != null) {
-            val tdm = cfg.optDouble("target_distance_m", 0.0)
-            if (tdm > 0.0 && tdm < targetKm * 1000.0) {
-                XposedBridge.log("[R7VqzN] auto-stop: WARN target_distance_m=$tdm < threshold=${targetKm * 1000}, possible mismatch")
-            }
-        }
-        val bySimulation = simulated != null && simulated >= targetKm * 1000.0 - 1.0
-        if ((distance < targetKm - 0.015 && !bySimulation) || triggeredFor?.get() === activity) return
-        if (bySimulation && distance < targetKm - 0.015) {
-            XposedBridge.log("[R7VqzN] auto-stop: simulated=${String.format(java.util.Locale.US, "%.0f", simulated)}m reached, ui=$distance km")
+        val targetDistanceM = cfg?.optDouble("target_distance_m", 0.0) ?: 0.0
+        val simSaturated = simulated != null && targetDistanceM > 0.0 && simulated >= targetDistanceM - 1.0
+        val uiReached = distance >= targetKm - 0.015
+        if ((!uiReached && !simSaturated) || triggeredFor?.get() === activity) return
+        if (simSaturated && !uiReached) {
+            XposedBridge.log("[R7VqzN] auto-stop: sim saturated=${String.format(java.util.Locale.US, "%.0f", simulated)}m but ui=$distance km < target, force stop")
         }
 
         // 到点不等于该结束：定向打卡跑区还要求打满打卡点。tv_log_count 是已打卡数，
@@ -211,7 +207,7 @@ internal object LepaoAutoStop {
     private fun stopAfterPause(handler: Handler, activity: Activity, attempt: Int = 0) {
         val stop = findByAllRoots(STOP_ID)
         if (stop == null || !stop.isShown) {
-            if (attempt < 6) {
+            if (attempt < 10) {
                 handler.postDelayed({ stopAfterPause(handler, activity, attempt + 1) }, 1500)
                 return
             }
