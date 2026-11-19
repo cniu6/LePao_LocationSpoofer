@@ -774,6 +774,10 @@ fun MainViewModel.switchLepaoAccount(
     settingsRepository.lepaoRunRecordsJson = ""
     viewModelScope.launch {
         try {
+            // 启动前先强停：否则任务里已经卡住的 SplashActivity 会被 LAUNCH_MULTIPLE 直接复用，
+            // 永远不会重新走初始化，切号广播也就没人接收，表现为“一键跑打不开”。
+            runCatching { locationRepository.forceStopApps(listOf(LEPAO_PKG)) }
+            kotlinx.coroutines.delay(600)
             val written = withContext(Dispatchers.IO) {
                 com.kdzw8p.mqa.v71f.utils.LepaoOfflineAccount.write(context, p)
             }
@@ -1002,7 +1006,43 @@ fun MainViewModel.rememberLepaoSchoolId(schoolId: String) {
 
 fun MainViewModel.exportLepaoBackup(): String = settingsRepository.exportLepaoBackup()
 
-fun MainViewModel.importLepaoBackup(json: String): Boolean = settingsRepository.importLepaoBackup(json)
+fun MainViewModel.importLepaoBackup(json: String): Boolean {
+    val ok = settingsRepository.importLepaoBackup(json)
+    if (!ok) return ok
+    // 包里带 wx_openid / wx_login_token 的账号，导入后马上用纯 HTTP 直连 quickLoginV339
+    // 换一份新会话写回档案：切号时 patch 进乐跑的就是刚签发的 lp_token，
+    // 不会像手写 MMKV 那样撞上旧票据过期。
+    viewModelScope.launch(Dispatchers.IO) {
+        val profiles = runCatching { JSONObject(json).optJSONObject("profiles") }.getOrNull() ?: return@launch
+        for (name in profiles.keys()) {
+            val packed = profiles.optJSONObject(name) ?: continue
+            val openId = packed.optString("wx_openid")
+            val wxToken = packed.optString("wx_login_token")
+            if (openId.isBlank() || wxToken.isBlank()) continue
+            val sess = runCatching { JSONObject(packed.optString("session")) }.getOrNull()
+            val outcome = runCatching {
+                com.kdzw8p.mqa.v71f.utils.LepaoDirectLogin.login(
+                    mode = com.kdzw8p.mqa.v71f.utils.LepaoDirectLogin.Mode.WECHAT,
+                    schoolId = packed.optString("school_id"),
+                    deviceId = sess?.optString("mobileDeviceId").orEmpty(),
+                    model = sess?.optString("mobileModel").orEmpty(),
+                    osVersion = android.os.Build.VERSION.RELEASE ?: "13",
+                    openId = openId,
+                    accessToken = wxToken,
+                    nickname = packed.optString("nickname"),
+                    avatarUrl = packed.optString("avatar_url"),
+                )
+            }.getOrNull() as? com.kdzw8p.mqa.v71f.utils.LepaoDirectLogin.Outcome.Success ?: continue
+            val profile = settingsRepository.getLepaoProfile(name) ?: packed
+            profile.put("user_id", outcome.result.userId)
+            profile.put("session", outcome.sessionJson)
+            if (outcome.result.nickname.isNotBlank()) profile.put("nickname", outcome.result.nickname)
+            if (outcome.result.avatarUrl.isNotBlank()) profile.put("avatar_url", outcome.result.avatarUrl)
+            settingsRepository.saveLepaoProfile(name, profile)
+        }
+    }
+    return ok
+}
 
 private fun MainViewModel.lepaoDeviceId(): String =
     android.provider.Settings.Secure.getString(

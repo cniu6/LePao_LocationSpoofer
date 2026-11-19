@@ -89,18 +89,10 @@ internal object LepaoAutoStop {
         // 自动结束会一直不触发；统一走全窗口根视图。
         val distance = (findByAllRoots(DISTANCE_ID) as? TextView)
             ?.text?.toString()?.trim()?.toDoubleOrNull() ?: return
-        // 模拟层在目标距离处已经把速度归零（位置停住但继续上报），乐跑自己累加的里程会停在
-        // 阈值下方；如果只等它凑够，计时会在原地空转，平均配速被拖成「速度过慢」。
-        // 模块自己的行程（含 offset、到目标饱和）才是准的：两边任一到达就触发。
-        val cfg = config()
-        val simulated = if (cfg == null) null else runCatching {
-            com.kdzw8p.mqa.v71f.xposed.utils.RouteEngine.traveledMeters(cfg)
-        }.getOrNull()
-        val bySimulation = simulated != null && simulated >= targetKm * 1000.0 - 1.0
-        if ((distance < targetKm - 0.015 && !bySimulation) || activity.hashCode() == triggeredFor) return
-        if (bySimulation && distance < targetKm - 0.015) {
-            XposedBridge.log("[R7VqzN] auto-stop: simulated=${String.format(java.util.Locale.US, "%.0f", simulated)}m reached, ui=$distance km")
-        }
+        // 到点必须真的达到目标：乐跑判的是 ≥ 最低里程，差 10 米也会判不合格。
+        // 乐跑自己的累加值可能比模拟距离差一点，所以目标处多跑 30 米（在 ConfigManager 侧加），
+        // 这里不再留向下容差。
+        if (distance < targetKm || activity.hashCode() == triggeredFor) return
 
         // 到点不等于该结束：定向打卡跑区还要求打满打卡点。tv_log_count 是已打卡数，
         // tv_tip 会显示「待分配(再跑 N 米后分配打卡点)」。没走完就继续跑，

@@ -68,16 +68,20 @@ object LepaoOfflineAccount {
             val oldMeta = meta.readBytes()
             val oldSp = sp.readBytes()
             val updated = patch(oldData, oldMeta, values)
-            val xml = patchPreferences(oldSp, values)
+            // 乐跑 4.3.3 的 shared_prefs/setting.xml 是加密二进制（不足 100 字节的密文），
+            // DocumentBuilder 必定抛 SAXParseException；只跳过它，MMKV 与 crc 照常写，
+            // 否则整个切号 helper 会被这份不可解析的文件卡死（主函数统一 exitProcess(42)）。
+            val xml = try { patchPreferences(oldSp, values) } catch (_: Throwable) { null }
             try {
                 // 原文件就地写入，保留 UID、权限与 SELinux 标签；失败同步回滚三份文件。
                 writeSynced(data, updated.first)
                 writeSynced(meta, updated.second)
-                writeSynced(sp, xml)
+                if (xml != null) writeSynced(sp, xml)
                 require(LepaoProfileSnapshot.decodeSession(data.readBytes()).userId == values.getValue("user_id"))
                 File(root, "shared_prefs/setting.xml.bak").delete()
             } catch (e: Exception) {
-                writeSynced(data, oldData); writeSynced(meta, oldMeta); writeSynced(sp, oldSp)
+                writeSynced(data, oldData); writeSynced(meta, oldMeta)
+                if (xml != null) writeSynced(sp, oldSp)
                 throw e
             } finally { oldData.fill(0); oldMeta.fill(0); oldSp.fill(0) }
             kotlin.system.exitProcess(0)
@@ -91,6 +95,21 @@ object LepaoOfflineAccount {
         val uid = profile.getString("user_id")
         val token = session.optString("token").ifBlank { session.optString("access_token") }
         require(LepaoRunData.isAccountId(uid) && session.optString("user_id") == uid && token.isNotBlank())
+        // 备份包若已带算好的 MMKV 键值（web 导出的就是这种），直接用它：
+        // 导入后切号写什么，导出时就定死了，不再依赖档案字段是否齐、也不再二次推导。
+        profile.optJSONObject("mmkv")?.let { baked ->
+            val out = linkedMapOf<String, String>()
+            for (key in keys) {
+                val value = baked.optString(key)
+                if (value.isNotEmpty()) out[key] = value
+            }
+            // 拿一份写着别人 uid 的快照不去刷；属于本账号就补齐 token 并直接返回。
+            if (out["user_id"] == uid) {
+                if (out["token"].isNullOrEmpty()) out["token"] = token
+                if (out["access_token"].isNullOrEmpty()) out["access_token"] = token
+                return out
+            }
+        }
         return linkedMapOf("user_id" to uid, "token" to token, "access_token" to token,
             "refresh_token" to session.optString("refresh_token"), "refresh_expire" to session.optString("refresh_expire", "0"),
             "role" to session.optString("role").ifBlank { profile.optString("role", "1") },

@@ -188,9 +188,10 @@ class ConfigManager(private val context: Context, private val rootManager: RootM
         json.put("lepao_report_version_name", settingsManager.lepaoReportVersionName)
         // 自动结束里程（公里）：空/0=关闭；Xposed 端到点对乐跑跑步页的结束按钮合成一次长按
         json.put("lepao_auto_stop_km", settingsManager.lepaoAutoStopKm)
-        // 目标距离（米）：模拟层据此做末段减速与到点停速（位置仍按同一坐标上报，不会反弹）
+        // 目标距离（米）：模拟层据此做末段减速与到点停速；
+        // 多跑 30 米余量，保证乐跑自己累加的里程能真正过合格线（差 10 米也会判不合格）。
         val autoStopKm = settingsManager.lepaoAutoStopKm.toDoubleOrNull() ?: 0.0
-        json.put("target_distance_m", if (autoStopKm > 0.0) autoStopKm * 1000.0 else 0.0)
+        json.put("target_distance_m", if (autoStopKm > 0.0) autoStopKm * 1000.0 + 30.0 else 0.0)
         json.put("speed_ramp_sec", MotionRealism.DEFAULT_SPEED_RAMP_SEC)
         json.put("target_decel_m", MotionRealism.DEFAULT_DECEL_DISTANCE_M)
         // 最低平均配速（秒/公里）：优先用本次会话按账号性别快照的值，没有就回退到男生默认；0 = 不限制
