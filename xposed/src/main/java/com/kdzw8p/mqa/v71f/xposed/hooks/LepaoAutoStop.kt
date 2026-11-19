@@ -14,6 +14,7 @@ import android.view.ViewGroup
 import android.widget.TextView
 import com.kdzw8p.mqa.v71f.xposed.utils.XposedBridge
 import org.json.JSONObject
+import java.lang.ref.WeakReference
 
 /**
  * 到点自动结束：跑步页布局里里程是 `tv_distance_value`（公里），结束按钮是
@@ -22,6 +23,12 @@ import org.json.JSONObject
  *
  * 配置 `lepao_auto_stop_km`：空串或 0 = 关闭；单位公里。取不到控件时每秒重试，
  * 同一 Activity 只触发一次，避免反复长按。
+ *
+ * 一键跑/批量跑契约：模块 App 发 AUTO_RUN_START(km, token) → 宿主自动进跑步页开跑；
+ * 每秒回传 RUN_STATUS(km, speed, elapsed, paused, phase, token)；到点结束并上传后回传
+ * AUTO_RUN_DONE(token)（重复 3 次防丢）。宿主无取消通道：模块取消仅中止编排、不停模拟，
+ * 宿主跑步维持现状由用户手动停止（取消时停模拟会让乐跑位置回落真实 GPS 造成漂移）。
+ * token 由模块每账号随机生成，回传校验，防第三方伪造回执与跨账号串扰。
  */
 internal object LepaoAutoStop {
     private const val HOST_PKG = "com.lptiyu.tanke"
@@ -32,12 +39,23 @@ internal object LepaoAutoStop {
     private const val ACTION_RUN_STATUS = "com.kdzw8p.mqa.v71f.RUN_STATUS"
     private const val MODULE_PKG = "com.kdzw8p.mqa.v71f"
 
+    /** 打卡不齐时最多续跑这么久就强制结束，防模拟饱和后永久卡死。 */
+    private const val LOG_WAIT_TIMEOUT_MS = 180_000L
+    /** 刚完成同公里数的跑，短窗口内再收到同参 START 视为重发：补发 DONE 而不开新跑。 */
+    private const val DONE_IDEMPOTENCY_MS = 30_000L
+
     private var installed = false
-    private var triggeredFor = 0
+    private var triggeredFor: WeakReference<Activity>? = null
     private var stopping = false
     /** 一键跑/批量跑时由广播传入的目标公里；非空时优先于配置项 */
     private var autoKm: Double? = null
+    /** 本次自动跑的会话令牌，回传 STATUS/DONE 时携带，供模块校验。 */
+    private var autoToken: String? = null
     private var automationBusy = false
+    /** 每次 startAutomation/cancel 递增，使旧的 stepAutomation handler 链失效，防脉冲风暴多链并发点击。 */
+    private var runGeneration = 0
+    /** finishAutomation 的上传窗口内置真：tick 持续广播 phase=uploading，模块据此不重发 START。 */
+    private var uploading = false
     private var lastStatusLogAt = 0L
     private var lastLogWaitAt = 0L
     private var startPressAt = 0L
@@ -45,6 +63,15 @@ internal object LepaoAutoStop {
     private var automationStartAt = 0L
     private var lastChronoText = ""
     private var lastChronoChangeAt = 0L
+    /** 打卡等待看门狗起点：首次进入「打卡不齐」时记录，超过 LOG_WAIT_TIMEOUT_MS 强制结束。 */
+    private var logWaitStartAt = 0L
+    /** 本次跑是否出现过打卡 UI（计数>0 或「待分配」）：自由跑页恒 0 的计数不当作「打卡不齐」。 */
+    private var seenCheckpointUi = false
+    /** 最近一次完成的公里数与时刻，用于 START 幂等去重。 */
+    private var lastDoneKm = 0.0
+    private var lastDoneAt = 0L
+    /** 上传窗口里回传 STATUS 用的最后里程。 */
+    private var lastUiKm = 0.0
 
     fun install(config: () -> JSONObject?) {
         if (installed) return
@@ -61,6 +88,11 @@ internal object LepaoAutoStop {
     }
 
     private fun tick(handler: Handler, config: () -> JSONObject?) {
+        // 上传窗口：跑步页可能已消失，仍持续广播 uploading 状态，模块据此不重发 START。
+        if (uploading) {
+            runCatching { broadcastUploading() }
+            return
+        }
         val top = topActivity()
         val inHost = top != null && top.packageName == HOST_PKG && !top.isFinishing
         // 跑步页的里程/速度/状态每秒发给模块，悬浮窗直接显示，不需要用户盯着宿主界面
@@ -79,8 +111,9 @@ internal object LepaoAutoStop {
         }
 
         if (stopping) return
+        val cfg = config()
         val targetKm = autoKm
-            ?: (config()?.optString("lepao_auto_stop_km").orEmpty().toDoubleOrNull() ?: return)
+            ?: (cfg?.optString("lepao_auto_stop_km").orEmpty().toDoubleOrNull() ?: return)
         if (targetKm <= 0.0) return
 
         val activity = top ?: return
@@ -92,12 +125,18 @@ internal object LepaoAutoStop {
         // 模拟层在目标距离处已经把速度归零（位置停住但继续上报），乐跑自己累加的里程会停在
         // 阈值下方；如果只等它凑够，计时会在原地空转，平均配速被拖成「速度过慢」。
         // 模块自己的行程（含 offset、到目标饱和）才是准的：两边任一到达就触发。
-        val cfg = config()
         val simulated = if (cfg == null) null else runCatching {
             com.kdzw8p.mqa.v71f.xposed.utils.RouteEngine.traveledMeters(cfg)
         }.getOrNull()
+        // 防御：模拟饱和目标低于停止阈值说明双源失配（快照未下发），打日志暴露而非静默死等。
+        if (cfg != null) {
+            val tdm = cfg.optDouble("target_distance_m", 0.0)
+            if (tdm > 0.0 && tdm < targetKm * 1000.0) {
+                XposedBridge.log("[R7VqzN] auto-stop: WARN target_distance_m=$tdm < threshold=${targetKm * 1000}, possible mismatch")
+            }
+        }
         val bySimulation = simulated != null && simulated >= targetKm * 1000.0 - 1.0
-        if ((distance < targetKm - 0.015 && !bySimulation) || activity.hashCode() == triggeredFor) return
+        if ((distance < targetKm - 0.015 && !bySimulation) || triggeredFor?.get() === activity) return
         if (bySimulation && distance < targetKm - 0.015) {
             XposedBridge.log("[R7VqzN] auto-stop: simulated=${String.format(java.util.Locale.US, "%.0f", simulated)}m reached, ui=$distance km")
         }
@@ -109,27 +148,33 @@ internal object LepaoAutoStop {
             ?.text?.toString()?.trim()?.toIntOrNull() ?: -1
         val pendingLog = (findByAllRoots("tv_tip") as? TextView)
             ?.text?.toString()?.contains("待分配") == true
+        if (logCount > 0 || pendingLog) seenCheckpointUi = true
         // logCount = -1 是读不到计数控件（不同版本 id 不同，实测 4.2.3 就读不到），
-        // 不能当成「打卡不足」，否则里程到了也会一直被拦；那种情况只信 tv_tip 的「待分配」。
-        val logIncomplete = pendingLog || logCount == 0
+        // 不能当成「打卡不足」；logCount == 0 也只在本次跑确实出现过打卡 UI 时才采信，
+        // 否则自由跑页恒 0 的计数会把普通无打卡跑误判成打卡不齐、拖到 1.5×。
+        val logIncomplete = pendingLog || (logCount == 0 && seenCheckpointUi)
         if (logIncomplete && distance < targetKm * 1.5) {
             val nowMs = SystemClock.uptimeMillis()
-            if (nowMs - lastLogWaitAt > 15_000L) {
-                lastLogWaitAt = nowMs
-                XposedBridge.log(
-                    "[R7VqzN] auto-stop: at ${distance}km but logs=$logCount pending=$pendingLog, keep running"
-                )
+            if (logWaitStartAt == 0L) logWaitStartAt = nowMs
+            if (nowMs - logWaitStartAt < LOG_WAIT_TIMEOUT_MS) {
+                if (nowMs - lastLogWaitAt > 15_000L) {
+                    lastLogWaitAt = nowMs
+                    XposedBridge.log(
+                        "[R7VqzN] auto-stop: at ${distance}km but logs=$logCount pending=$pendingLog, keep running"
+                    )
+                }
+                return
             }
-            return
+            // 看门狗：打卡等待超时（模拟可能已饱和、里程不再增长），强制走结束流程兜底防卡死。
+            XposedBridge.log("[R7VqzN] auto-stop: checkpoint wait timeout, force stop at ${distance}km")
+        } else {
+            logWaitStartAt = 0L
         }
-
-        // 均速不够就继续跑的做法会把 1.8 公里无限拖下去（乐跑判的是全程均值，跑完就定），
-        // 真正该做的是把速度拉到位，而不是到点了还不结束。这里只保留里程判定。
 
         val stop = findByAllRoots(STOP_ID)
         if (stop != null && stop.visibility == View.VISIBLE && stop.isShown) {
             // 已暂停：直接长按结束
-            triggeredFor = activity.hashCode()
+            triggeredFor = WeakReference(activity)
             stopping = true
             XposedBridge.log("[R7VqzN] auto-stop: distance=$distance km >= $targetKm, long-press stop")
             longPress(handler, stop) {
@@ -141,7 +186,7 @@ internal object LepaoAutoStop {
                         stopRetries++
                         XposedBridge.log("[R7VqzN] auto-stop: stop not applied, retry ${stopRetries}")
                         stopping = false
-                        triggeredFor = 0
+                        triggeredFor = null
                         return@postDelayed
                     }
                     stopRetries = 0
@@ -154,7 +199,7 @@ internal object LepaoAutoStop {
         // 跑步中是「长按暂停」，暂停后 tv_stoprun 才出现；先暂停再结束
         val pause = findByAllRoots("tv_start_pause_continue_run")
         if (pause == null || !pause.isShown) return
-        triggeredFor = activity.hashCode()
+        triggeredFor = WeakReference(activity)
         stopping = true
         XposedBridge.log("[R7VqzN] auto-stop: distance=$distance km >= $targetKm, long-press pause")
         longPress(handler, pause) {
@@ -172,7 +217,7 @@ internal object LepaoAutoStop {
             }
             // 长按暂停可能没生效；清掉 triggeredFor，下一秒的 tick 会重新暂停再试
             XposedBridge.log("[R7VqzN] auto-stop: stop button still hidden, retry next tick")
-            triggeredFor = 0
+            triggeredFor = null
             stopping = false
             return
         }
@@ -186,11 +231,12 @@ internal object LepaoAutoStop {
         }
     }
 
-    /** 跑步页实时状态：里程(km)、速度(m/s)、计时、是否暂停。 */
+    /** 跑步页实时状态：里程(km)、速度(m/s)、计时、是否暂停。携带 token 与 phase 供模块校验/判别。 */
     private fun broadcastRunStatus(activity: Activity) {
         // 跑步页的控件不在 topActivity 的 decor 里（外壳 Activity + 独立窗口），用全窗口根视图找
         val kmView = findByAllRoots(DISTANCE_ID) as? TextView ?: return
         val km = kmView.text?.toString()?.trim()?.toDoubleOrNull() ?: return
+        lastUiKm = km
         val speed = (findByAllRoots("tv_speed_value") as? TextView)
             ?.text?.toString()?.trim()?.toDoubleOrNull() ?: 0.0
         val pauseText = (findByAllRoots("tv_start_pause_continue_run") as? TextView)
@@ -208,12 +254,7 @@ internal object LepaoAutoStop {
         var speedValue = speed
         // 乐跑跑步页显示的是平均配速，tv_speed_value 常常是 0；这时用里程/用时算平均速度
         if (speedValue <= 0.0 && km > 0.0) {
-            val parts = elapsedText.split(":").mapNotNull { it.trim().toIntOrNull() }
-            val seconds = when (parts.size) {
-                3 -> parts[0] * 3600 + parts[1] * 60 + parts[2]
-                2 -> parts[0] * 60 + parts[1]
-                else -> 0
-            }
+            val seconds = parseChronoSeconds(elapsedText)
             if (seconds > 0) speedValue = km * 1000.0 / seconds
         }
         val app = currentApplication() ?: return
@@ -226,6 +267,18 @@ internal object LepaoAutoStop {
             Intent(ACTION_RUN_STATUS).setPackage(MODULE_PKG)
                 .putExtra("km", km).putExtra("speed", speedValue)
                 .putExtra("elapsed", elapsedText).putExtra("paused", paused)
+                .putExtra("phase", "running").putExtra("token", autoToken.orEmpty())
+        )
+    }
+
+    /** 上传窗口里的状态回传：跑步页可能已不在，仍告诉模块「正在上传」，避免模块误判失联重发 START。 */
+    private fun broadcastUploading() {
+        val app = currentApplication() ?: return
+        app.sendBroadcast(
+            Intent(ACTION_RUN_STATUS).setPackage(MODULE_PKG)
+                .putExtra("km", lastUiKm).putExtra("speed", 0.0)
+                .putExtra("elapsed", "").putExtra("paused", false)
+                .putExtra("phase", "uploading").putExtra("token", autoToken.orEmpty())
         )
     }
 
@@ -245,8 +298,7 @@ internal object LepaoAutoStop {
         }, 2200)
     }
 
-    /** 结束确认框通常在独立窗口，遍历 WindowManagerGlobal.mViews 而不是只看 Activity。 */
-    /** 接收模块 App 的「一键跑」指令：自动点进跑步页，结束后回传 AUTO_RUN_DONE。 */
+    /** 接收模块 App 的「一键跑」指令与取消指令。 */
     private fun registerAutomationReceiver(attempt: Int = 0) {
         val app = currentApplication()
         if (app == null) {
@@ -260,54 +312,69 @@ internal object LepaoAutoStop {
                 override fun onReceive(context: Context?, intent: Intent?) {
                     if (intent?.action != ACTION_RUN_START) return
                     val km = intent.getStringExtra("km")?.toDoubleOrNull() ?: return
-                    startAutomation(km)
+                    val token = intent.getStringExtra("token").orEmpty()
+                    startAutomation(km, token)
                 }
             }, IntentFilter(ACTION_RUN_START), Context.RECEIVER_EXPORTED)
             XposedBridge.log("[R7VqzN] auto-run: receiver registered")
         }
     }
 
-    private fun startAutomation(km: Double) {
+    private fun startAutomation(km: Double, token: String) {
         if (km <= 0.0) return
+        // 幂等：刚完成同公里数的跑，短窗口内的同参 START 是模块重发（DONE 可能丢了），
+        // 补发 DONE 即可，绝不开新跑——否则会在真实位置重复跑并上传垃圾记录。
+        if (lastDoneAt > 0L && SystemClock.uptimeMillis() - lastDoneAt < DONE_IDEMPOTENCY_MS &&
+            kotlin.math.abs(lastDoneKm - km) < 0.001
+        ) {
+            XposedBridge.log("[R7VqzN] auto-run: duplicate start km=$km, resend done")
+            sendDone(token)
+            return
+        }
         // 上一次自动跑可能停在跑步页或已被用户手动结束，automationBusy 不清会让后续一键跑全部失效；
-        // 超过 90 秒或跑步页已不在，就当作陈旧状态重置。
+        // 超过 90 秒就当作陈旧状态重置。不再用「跑步页不在」判陈旧——开跑前宿主还在首页，
+        // 那会让模块的每次 START 脉冲都重置状态、并发多条点击链（脉冲风暴）。
         if (automationBusy) {
-            val stale = SystemClock.uptimeMillis() - automationStartAt > 90_000 ||
-                findByAllRoots(DISTANCE_ID) == null
+            val stale = SystemClock.uptimeMillis() - automationStartAt > 90_000
             if (!stale) return
             XposedBridge.log("[R7VqzN] auto-run: reset stale automation state")
             automationBusy = false
             autoKm = null
         }
+        runGeneration++
         automationBusy = true
         automationStartAt = SystemClock.uptimeMillis()
         startPressAt = 0L
         stopRetries = 0
+        triggeredFor = null
+        stopping = false
+        logWaitStartAt = 0L
+        seenCheckpointUi = false
         autoKm = km
+        autoToken = token
+        val gen = runGeneration
         val handler = Handler(Looper.getMainLooper())
-        XposedBridge.log("[R7VqzN] auto-run: start km=$km")
-        handler.postDelayed({ stepAutomation(handler, 0) }, 1200)
+        XposedBridge.log("[R7VqzN] auto-run: start km=$km gen=$gen")
+        handler.postDelayed({ stepAutomation(handler, 0, gen) }, 1200)
     }
 
-    /** 首页「开始乐跑」→「自由跑」(dialog_confirm) → MapRunActivity 的「开始」。 */
-    private fun stepAutomation(handler: Handler, attempt: Int) {
-        if (!automationBusy) return
+    /** 首页「开始乐跑」→「自由跑」(dialog_confirm) → MapRunActivity 的「开始」。gen 失效即中止旧链。 */
+    private fun stepAutomation(handler: Handler, attempt: Int, gen: Int) {
+        if (!automationBusy || gen != runGeneration) return
         val activity = topActivity()
         if (activity == null || activity.packageName != HOST_PKG) {
-            retryAutomation(handler, attempt)
+            retryAutomation(handler, attempt, gen)
             return
         }
         // 乐跑重启后会问「检测到您有未完成的跑步记录，是否恢复？」；
         // 一键跑要求每个账号每次从头，所以选不恢复。
         val restoreRoot = allWindowRoots().firstOrNull { containsText(it, "未完成的跑步") }
         if (restoreRoot != null) {
-            // 实测弹窗：「检测到您有未完成的跑步记录，是否恢复？」按钮是「放弃 / 恢复」，
-            // 一键跑要每次从头，选「放弃」。
             val decline = findClickableByText(restoreRoot, listOf("放弃", "不恢复", "重新开始", "重新跑步", "否", "取消"))
             if (decline != null) {
                 decline.second.performClick()
                 XposedBridge.log("[R7VqzN] auto-run: declined restore (${decline.first})")
-                handler.postDelayed({ stepAutomation(handler, attempt + 1) }, 1800)
+                handler.postDelayed({ stepAutomation(handler, attempt + 1, gen) }, 1800)
                 return
             }
         }
@@ -319,14 +386,12 @@ internal object LepaoAutoStop {
         if (dialogStart != null) {
             dialogStart.second.performClick()
             XposedBridge.log("[R7VqzN] auto-run: clicked ${dialogStart.first}")
-            handler.postDelayed({ stepAutomation(handler, attempt + 1) }, 2200)
+            handler.postDelayed({ stepAutomation(handler, attempt + 1, gen) }, 2200)
             return
         }
         if (findByAllRoots(DISTANCE_ID) != null) {
             // 进跑步页不等于已开跑：定向打卡等模式底部仍是「开始乐跑」，里程 0.00 / 用时 00:00:00。
-            // 只有确认在跑（按钮显示「长按暂停」或计时已走）才停手，否则再点会把跑步暂停。
-            // 底部开始/暂停/继续是 TextProgressBar（id tv_start_pause_continue_run），文字画在画布上，
-            // 没有 TextView 文本可读，也不能 performClick；开跑要合成一次长按。
+            // 只有确认在跑（计时已走或距离>0）才停手，否则再点会把跑步暂停。
             val chrono = (findByAllRoots("chronometer") as? TextView)?.text?.toString()?.trim().orEmpty()
             // 乐跑开跑前有 3-2-1 倒计时，倒计时期间 chronometer 一直是 00:00:00，
             // 光看计时会把「已经开始倒计时」当成没开跑，于是再长按一次——那次落在已开跑之后，
@@ -342,7 +407,7 @@ internal object LepaoAutoStop {
             if (confirmRun != null && confirmRun.isShown) {
                 confirmRun.performClick()
                 XposedBridge.log("[R7VqzN] auto-run: clicked run-page confirm")
-                handler.postDelayed({ stepAutomation(handler, attempt + 1) }, 2200)
+                handler.postDelayed({ stepAutomation(handler, attempt + 1, gen) }, 2200)
                 return
             }
             val startBtn = findByAllRoots("tv_start_pause_continue_run")
@@ -350,25 +415,25 @@ internal object LepaoAutoStop {
                 // 长按后 6 秒内不重复（倒计时 3 秒 + 启动开销），否则第二次长按会变成「长按暂停」
                 val sincePress = SystemClock.uptimeMillis() - startPressAt
                 if (startPressAt > 0L && sincePress < 6_000L) {
-                    handler.postDelayed({ stepAutomation(handler, attempt + 1) }, 1500)
+                    handler.postDelayed({ stepAutomation(handler, attempt + 1, gen) }, 1500)
                     return
                 }
                 startPressAt = SystemClock.uptimeMillis()
                 XposedBridge.log("[R7VqzN] auto-run: long-press start on run page")
                 longPress(handler, startBtn) {
-                    handler.postDelayed({ stepAutomation(handler, attempt + 1) }, 2500)
+                    handler.postDelayed({ stepAutomation(handler, attempt + 1, gen) }, 2500)
                 }
                 return
             }
             XposedBridge.log("[R7VqzN] auto-run: run page idle, no start control found")
-            retryAutomation(handler, attempt)
+            retryAutomation(handler, attempt, gen)
             return
         }
         val confirm = findByAllRoots("dialog_confirm")
         if (confirm != null && confirm.isShown) {
             confirm.performClick()
             XposedBridge.log("[R7VqzN] auto-run: clicked 自由跑")
-            handler.postDelayed({ stepAutomation(handler, attempt + 1) }, 2200)
+            handler.postDelayed({ stepAutomation(handler, attempt + 1, gen) }, 2200)
             return
         }
         // 时段校验弹窗的按钮 id 在不同版本/皮肤下不一定保留，用文本兜底
@@ -376,42 +441,58 @@ internal object LepaoAutoStop {
         if (freeRun != null) {
             freeRun.second.performClick()
             XposedBridge.log("[R7VqzN] auto-run: clicked 自由跑(text)")
-            handler.postDelayed({ stepAutomation(handler, attempt + 1) }, 2200)
+            handler.postDelayed({ stepAutomation(handler, attempt + 1, gen) }, 2200)
             return
         }
         val startRun = findClickableByText(activity.window.decorView, listOf("开始乐跑"))
         if (startRun != null) {
             startRun.second.performClick()
             XposedBridge.log("[R7VqzN] auto-run: clicked 开始乐跑")
-            handler.postDelayed({ stepAutomation(handler, attempt + 1) }, 1800)
+            handler.postDelayed({ stepAutomation(handler, attempt + 1, gen) }, 1800)
             return
         }
-        retryAutomation(handler, attempt)
+        retryAutomation(handler, attempt, gen)
     }
 
-    private fun retryAutomation(handler: Handler, attempt: Int) {
-        if (!automationBusy) return
+    private fun retryAutomation(handler: Handler, attempt: Int, gen: Int) {
+        if (!automationBusy || gen != runGeneration) return
         if (attempt > 100) {
             XposedBridge.log("[R7VqzN] auto-run: give up waiting UI")
             automationBusy = false
             autoKm = null
             return
         }
-        handler.postDelayed({ stepAutomation(handler, attempt + 1) }, 1500)
+        handler.postDelayed({ stepAutomation(handler, attempt + 1, gen) }, 1500)
     }
 
-    /** 上报完成：等上传页稳定后回传模块，并关闭宿主，便于下一账号切换。 */
+    /** 上报完成：等上传页稳定后回传模块（重复 3 次防丢），并关闭宿主，便于下一账号切换。 */
     private fun finishAutomation() {
         if (!automationBusy) return
+        uploading = true
+        val tok = autoToken
+        val km = autoKm ?: 0.0
         Handler(Looper.getMainLooper()).postDelayed({
-            runCatching {
-                currentApplication()?.sendBroadcast(Intent(ACTION_RUN_DONE).setPackage(MODULE_PKG))
-            }
+            sendDone(tok)
+            // DONE 可能随 finishAffinity/进程回收丢失，间隔 2s 补发两次；模块 done.complete 幂等。
+            Handler(Looper.getMainLooper()).postDelayed({ sendDone(tok) }, 2000)
+            Handler(Looper.getMainLooper()).postDelayed({ sendDone(tok) }, 4000)
             runCatching { topActivity()?.finishAffinity() }
             XposedBridge.log("[R7VqzN] auto-run: done, host closed")
+            lastDoneKm = km
+            lastDoneAt = SystemClock.uptimeMillis()
             automationBusy = false
             autoKm = null
+            autoToken = null
+            uploading = false
         }, 12_000)
+    }
+
+    private fun sendDone(token: String?) {
+        runCatching {
+            currentApplication()?.sendBroadcast(
+                Intent(ACTION_RUN_DONE).setPackage(MODULE_PKG).putExtra("token", token.orEmpty())
+            )
+        }
     }
 
     /** 乐跑计时器文本（mm:ss / h:mm:ss）转秒；读不到返回 0。 */

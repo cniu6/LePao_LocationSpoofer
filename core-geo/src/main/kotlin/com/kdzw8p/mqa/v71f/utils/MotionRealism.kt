@@ -196,6 +196,8 @@ object MotionRealism {
 
         /** 真实度关闭时全部波动归零，保持旧版均匀运动的遗留语义 */
         private val wanderShare = if (level == Level.OFF) 0.0 else CADENCE_WANDER_SHARE
+        // 碎抖动 likewise 在真实度关闭时归零，保持 OFF「匀速匀步频」的遗留语义（否则 steps/cadence 仍带噪声）
+        private val fastShare = if (level == Level.OFF) 0.0 else CADENCE_FAST_SHARE
         private val fluctuation = this.speedFluctuationPct / 100.0
         private val speedNoise = SmoothNoise(startTimestamp xor SPEED_SALT, 20.0, 600.0)
         private val cadenceNoise = SmoothNoise(startTimestamp xor CADENCE_SALT, 3.0, 60.0)
@@ -286,7 +288,7 @@ object MotionRealism {
             1 + CADENCE_SHARE_OF_SPEED * fluctuation * variationAt(elapsedSec) +
                 0.5 * level.cadenceVariation * cadenceNoise.value(elapsedSec) +
                 wanderShare * cadenceWander.value(elapsedSec) +
-                CADENCE_FAST_SHARE * cadenceFast.value(elapsedSec) +
+                fastShare * cadenceFast.value(elapsedSec) +
                 cadenceDipShare * slowdownAt(elapsedSec)
             )
 
@@ -296,7 +298,7 @@ object MotionRealism {
                 CADENCE_SHARE_OF_SPEED * fluctuation * variationIntegral(elapsedSec) +
                 0.5 * level.cadenceVariation * cadenceNoise.integral(elapsedSec) +
                 wanderShare * cadenceWander.integral(elapsedSec) +
-                CADENCE_FAST_SHARE * cadenceFast.integral(elapsedSec) +
+                fastShare * cadenceFast.integral(elapsedSec) +
                 cadenceDipShare * (dips?.integral(elapsedSec) ?: 0.0)
             )
 

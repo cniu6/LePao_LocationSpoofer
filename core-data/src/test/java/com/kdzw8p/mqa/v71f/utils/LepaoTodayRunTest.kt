@@ -11,7 +11,7 @@ class LepaoTodayRunTest {
     private val zone = ZoneId.of("Asia/Shanghai")
     private val now = Instant.parse("2026-10-25T05:00:00Z")
     private fun record(id: Long, time: String, uid: String = "123") = JSONObject()
-        .put("id", id).put("start_time", time).put("uid", uid)
+        .put("id", id).put("start_time", time).put("uid", uid).put("record_status", "1")
     private fun page(vararg rows: JSONObject) = JSONObject().put("list", JSONArray(rows.toList()))
 
     @Test fun todayIsDeterminedByLocalCalendarNotUtcAndSupportsEpochUnits() {

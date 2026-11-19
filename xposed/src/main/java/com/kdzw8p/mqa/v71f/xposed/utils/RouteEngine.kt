@@ -86,25 +86,28 @@ object RouteEngine {
         // 再钳一道到目标距离：即使 realism 因参数退化没饱和，位置也不会越过目标点
         val targetTotal = config.optDouble("target_distance_m", 0.0)
         var traveled = if (targetTotal > 0.0) traveledRaw.coerceAtMost(targetTotal) else traveledRaw
+        // 到点饱和：位置钉在目标点、速度归零、不再叠加摆动。否则 offset≥target 时 realismSession
+        // 的 remaining=0 会被当成「无目标」而恢复满速，出现「原地小幅摆动却报 3m/s」的破绽。
+        if (targetTotal > 0.0 && traveledRaw >= targetTotal) {
+            val p = path.positionAt(targetTotal, config.optBoolean("stop_at_destination", false))
+            return SpoofedMotion(p.lat, p.lng, p.bearing, 0f)
+        }
 
-        // 最低平均配速：摇杆力度不足、降速块、下行噪声都会把平均速度压低。
-        // 低于设定配速时直接把行程抬到「已用时间 × 最低速度」这条线上（不够就加速），
-        // 只在进入末段减速区之前生效，避免和到点减速互相打架。
+        // 最低平均配速（分段语义）：摇杆力度不足、降速块、下行噪声都会把平均速度压低。
+        // 低于设定配速时把本段行程抬到「本段已用时间 × 最低速度」这条线上（不够就加速）。
+        // floor 与 traveled 同基准（都含 offset）：resume/换速后 offset 承接已跑距离、本段时长重新计，
+        // 底线按分段约束而非全程，避免长暂停后把 traveled 一次性顶前一大段造成位置瞬移。
         val minPaceSecPerKm = config.optDouble("min_pace_sec_per_km", 0.0)
         var paceLimited = false
         if (minPaceSecPerKm > 0.0 && elapsedSec > 0.0) {
-            // 摇杆模式下摇杆每帧重写 start_timestamp，elapsed 永远接近 0，底线就算不出来；
-            // 用一次会话里不变的 route_started_at 来量「本次已跑多久」。
-            val runStart = config.optLong("route_started_at", 0L).takeIf { it > 0L } ?: startTime
-            val runElapsed = (now - runStart).coerceAtLeast(0L) / 1000.0
-            // 从起步斜坡结束才开始计：否则一开跑就被底线顶到匀速，起步加速就没了
-            val rampSec = config.optDouble("speed_ramp_sec", MotionRealism.DEFAULT_SPEED_RAMP_SEC)
-            val paceElapsed = (runElapsed - rampSec).coerceAtLeast(0.0)
-            val required = paceElapsed / minPaceSecPerKm * 1000.0
+            // 续跑段（offset>0）已经在跑动中，不再扣起步斜坡，与 realismSession 的 rampSec=0 一致。
+            val rampSec = if (offset > 0.0) 0.0 else config.optDouble("speed_ramp_sec", MotionRealism.DEFAULT_SPEED_RAMP_SEC)
+            val paceElapsed = (elapsedSec - rampSec).coerceAtLeast(0.0)
+            val requiredSeg = paceElapsed / minPaceSecPerKm * 1000.0
             val decelGuard = if (targetTotal > 0.0) {
                 (targetTotal - config.optDouble("target_decel_m", MotionRealism.DEFAULT_DECEL_DISTANCE_M)).coerceAtLeast(0.0)
             } else Double.MAX_VALUE
-            val floor = if (targetTotal > 0.0) required.coerceAtMost(targetTotal) else required
+            val floor = (offset + requiredSeg).let { if (targetTotal > 0.0) it.coerceAtMost(targetTotal) else it }
             if (traveled < floor && traveled < decelGuard) {
                 traveled = floor
                 paceLimited = true
@@ -158,8 +161,11 @@ object RouteEngine {
         return AltitudeModel.altitude(base, variation, drift, pos.lat, pos.lng, now)
     }
 
-    /** 当前模拟已行进的距离（米）：含 offset，已按目标距离饱和；供 UI 侧判定「到点」用。 */
+    /** 当前模拟已行进的距离（米）：含 offset，已按目标距离饱和；供 UI 侧判定「到点」用。
+     *  非路线模式（摇杆/定点）返回 0：摇杆每帧重写 start_timestamp 使读数无意义，且 patchConfig
+     *  可能残留上一路线会话的 route_distance_offset，若不 guard 会让 bySimulation 在 UI 0.0x 时即真、秒停。 */
     fun traveledMeters(config: JSONObject, now: Long = System.currentTimeMillis()): Double {
+        if (!config.optBoolean("is_route_mode", false)) return 0.0
         val speed = config.optDouble("speed_m_s", 3.0).coerceAtLeast(0.1)
         val rawStartTime = config.optLong("start_timestamp", 0L)
         val startTime = if (rawStartTime > 0L) rawStartTime else now

@@ -223,8 +223,11 @@ class FloatingJoystickService : Service(), LifecycleOwner, ViewModelStoreOwner, 
                         onCadenceStep = { spm -> lifecycleScope.launch { locationRepository.updateStepCadence(spm) } },
                         onAutoStopKm = { value ->
                             overlaySettings.lepaoAutoStopKm = value
+                            // 只触发一次配置刷新：putPersistentSettings 会从 settings 重新写入
+                            // lepao_auto_stop_km 并派生 target_distance_m，无需在此直接 put（会被覆盖，
+                            // 且若调整覆盖顺序就成了新的双源失配点）。
                             lifecycleScope.launch {
-                                configManager.patchConfig { it.put("lepao_auto_stop_km", value) }
+                                configManager.patchConfig { }
                             }
                         }
                     )

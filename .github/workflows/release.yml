@@ -148,6 +148,13 @@ jobs:
           java-version: '17' # Gradle 需要 Java 17 进行编译
           cache: 'gradle'
 
+      - name: Run unit tests
+        if: steps.check_version.outputs.changed == 'true'
+        run: |
+          chmod +x ./gradlew
+          # 发版前先过纯 JVM 单测门槛（几何/运动控制/轨迹引擎/乐跑数据解析），回归通过才打包。
+          ./gradlew --no-daemon :core-geo:test :core-data:test :xposed:test :app-ui:test
+
       - name: Decode Keystore
         if: steps.check_version.outputs.changed == 'true'
         env:

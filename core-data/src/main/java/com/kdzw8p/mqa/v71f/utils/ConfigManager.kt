@@ -186,11 +186,17 @@ class ConfigManager(private val context: Context, private val rootManager: RootM
         // 版本上报覆盖：空串=按真实安装版本上报（默认），非空时乐跑请求的参数用它
         json.put("lepao_report_version_code", settingsManager.lepaoReportVersionCode)
         json.put("lepao_report_version_name", settingsManager.lepaoReportVersionName)
-        // 自动结束里程（公里）：空/0=关闭；Xposed 端到点对乐跑跑步页的结束按钮合成一次长按
+        // 自动结束里程（公里）：空/0=关闭；Xposed 端到点对乐跑跑步页的结束按钮合成一次长按。
+        // 这是用户面板设置，仅在宿主未收到一键跑广播 km（autoKm 为空，即手动模拟）时作停止阈值兜底。
         json.put("lepao_auto_stop_km", settingsManager.lepaoAutoStopKm)
-        // 目标距离（米）：模拟层据此做末段减速与到点停速（位置仍按同一坐标上报，不会反弹）
+        // 目标距离（米）：模拟层据此做末段减速与到点停速（位置仍按同一坐标上报，不会反弹）。
+        // 一键跑/批量跑优先用会话快照（按账号目标公里写入，含打卡续跑余量），保证模拟饱和目标
+        // 不低于宿主停止阈值，避免摇杆面板残留的 lepao_auto_stop_km 把模拟提前钳死导致卡死。
+        // 快照为 0（手动模拟）时回退到面板设置，与宿主兜底阈值同源。
         val autoStopKm = settingsManager.lepaoAutoStopKm.toDoubleOrNull() ?: 0.0
-        json.put("target_distance_m", if (autoStopKm > 0.0) autoStopKm * 1000.0 else 0.0)
+        val targetDistanceM = if (SpoofingState.targetDistanceM > 0.0) SpoofingState.targetDistanceM
+            else if (autoStopKm > 0.0) autoStopKm * 1000.0 else 0.0
+        json.put("target_distance_m", targetDistanceM)
         json.put("speed_ramp_sec", MotionRealism.DEFAULT_SPEED_RAMP_SEC)
         json.put("target_decel_m", MotionRealism.DEFAULT_DECEL_DISTANCE_M)
         // 最低平均配速（秒/公里）：优先用本次会话按账号性别快照的值，没有就回退到男生默认；0 = 不限制

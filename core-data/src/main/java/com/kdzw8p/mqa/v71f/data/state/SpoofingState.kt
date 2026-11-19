@@ -35,6 +35,14 @@ object SpoofingState {
     /** 本次会话的最低平均配速（秒/公里）：按账号性别在开始模拟时写入；-1 = 未设置 */
     var minPaceSecPerKm = -1.0
 
+    /**
+     * 本次会话的模拟饱和目标（米）：一键跑/批量跑在开始模拟时按账号目标公里写入，
+     * 供 ConfigManager 下发 target_distance_m，使模拟层与宿主停止阈值同源，避免
+     * 摇杆面板残留的 lepao_auto_stop_km 把模拟提前钳死。0 = 未设置（手动模拟），
+     * 此时 ConfigManager 回退到 lepao_auto_stop_km 设置。停止模拟时清零。
+     */
+    var targetDistanceM = 0.0
+
     /** 路线暂停后继续时，从暂停处的累计距离（米）接着走；新会话开始时清零 */
     var routeDistanceOffset = 0.0
 }
