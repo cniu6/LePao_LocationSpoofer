@@ -306,6 +306,9 @@ class MotionController(
 
     private fun realism(start: Long): MotionRealism.Session {
         val (level, pct) = realismParams()
+        // 注意（已知后续项）：Xposed 端 RouteEngine.realismSession 额外传入 ramp/target/decel/baseSpeed，
+        // 与此处公式存在分叉，pause/换速固化 offset 时会略有虚增。对齐需先确定 level OFF 是否保留匀速语义
+        // 并同步更新 MotionControllerTest，故本次自动化修复不在此改动，避免破坏路线播放回归。
         return MotionRealism.session(start, level, pct, slowdownParams(), cadenceDipPct())
     }
 

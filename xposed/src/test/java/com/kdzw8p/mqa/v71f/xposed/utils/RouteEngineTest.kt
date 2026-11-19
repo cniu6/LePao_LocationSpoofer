@@ -149,6 +149,8 @@ class RouteEngineTest {
             put("speed_m_s", 2.0)
             put("start_timestamp", start)
             put("route_distance_offset", offset)
+            // 本用例验证暂停/继续的距离连续性，关掉起步斜坡以免匀速假设被斜坡损耗破坏
+            put("speed_ramp_sec", 0.0)
         }
         val paused = RouteEngine.calculateCurrentPosition(cfg(0.0, 1_000L), now = 101_000L) // 走了 200 米时暂停
         val resumed = RouteEngine.calculateCurrentPosition(cfg(200.0, 500_000L), now = 500_000L) // 继续的瞬间
@@ -179,5 +181,69 @@ class RouteEngineTest {
         // 旧版配置没有变化范围字段时按随机强度的漂移幅度（中档 ±3 米）处理
         val legacy = (0..600 step 10).map { RouteEngine.realisticAltitude(cfg(null), now = 1_000_000L + it * 1000L) }
         assertTrue(legacy.all { it in 77.0..83.0 })
+    }
+
+    // ---- 自动化里程判定回归（里程双源 / 到点饱和 / 分段配速底线）----
+
+    @Test
+    fun `traveledMeters returns zero for non-route mode even with residual offset`() {
+        // 摇杆/定点模式：patchConfig 可能残留上一路线会话的 offset，若不 guard 会让宿主秒停。
+        val config = JSONObject().apply {
+            put("is_route_mode", false)
+            put("sim_mode", "JOYSTICK")
+            put("speed_m_s", 3.0)
+            put("start_timestamp", 1L)
+            put("route_distance_offset", 5000.0)
+            put("target_distance_m", 1800.0)
+        }
+        assertEquals(0.0, RouteEngine.traveledMeters(config, now = 100_000L), 0.0)
+    }
+
+    @Test
+    fun `traveledMeters saturates at the target distance`() {
+        val config = JSONObject().apply {
+            put("is_route_mode", true)
+            put("route_points", pointsJson(0.0 to 0.0, 0.01 to 0.0))
+            put("speed_m_s", 2.0)
+            put("start_timestamp", 1L)
+            put("target_distance_m", 2700.0) // 1.5 × 1.8km
+        }
+        // 时间足够长，行程远超目标，但饱和钳在 target_distance_m。
+        assertEquals(2700.0, RouteEngine.traveledMeters(config, now = 10_000_000L), 1.0)
+    }
+
+    @Test
+    fun `reaching target pins position and zeroes speed even when offset exceeds target`() {
+        // offset≥target 时 remaining=0 曾被当成「无目标」恢复满速 → 原地摆动却报 3m/s。
+        val config = JSONObject().apply {
+            put("is_route_mode", true)
+            put("route_points", pointsJson(0.0 to 0.0, 0.01 to 0.0))
+            put("speed_m_s", 3.0)
+            put("start_timestamp", 1L)
+            put("route_distance_offset", 3000.0)
+            put("target_distance_m", 2700.0)
+            put("sway_scale", 1.0)
+        }
+        val motion = RouteEngine.calculateCurrentPosition(config, now = 100_000L)
+        assertEquals(0f, motion.speed)
+    }
+
+    @Test
+    fun `min pace floor is segment based and does not teleport right after resume`() {
+        val route = pointsJson(0.0 to 0.0, 0.02 to 0.0)
+        fun cfg(offset: Double, start: Long) = JSONObject().apply {
+            put("is_route_mode", true)
+            put("route_points", route)
+            put("speed_m_s", 2.0)
+            put("start_timestamp", start)
+            put("route_distance_offset", offset)
+            put("min_pace_sec_per_km", 320.0) // 最低速 3.125m/s > 2.0，底线会生效
+            put("target_distance_m", 0.0)
+            put("sway_scale", 0.0)
+            put("route_offset_m", 0.0)
+        }
+        // 继续的瞬间：本段时长为 0，底线 floor=offset+0=offset，位置应恰在 offset 处而非前跳。
+        val atResume = RouteEngine.calculateCurrentPosition(cfg(500.0, 1_000_000L), now = 1_000_000L)
+        assertEquals(500.0 / 111_320.0, atResume.lat, 1e-6)
     }
 }

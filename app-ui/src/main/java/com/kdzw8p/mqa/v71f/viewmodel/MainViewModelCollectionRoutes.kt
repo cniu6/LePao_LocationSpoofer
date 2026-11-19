@@ -263,11 +263,11 @@ data class LepaoProfileRow(
             json.optString("user_id") == userId && json.optString("token").isNotBlank()
     }.getOrDefault(false)
     /**
-     * 服务端对这张票的明确判定才算会话过期：101/102，或 info 直接写「登录信息失效」。
-     * 网络错误、超时、其它业务码仍只算刷新失败，不能推断成要重新登录。
+     * 服务端对这张票的明确判定才算会话过期：102，或 info 直接写「登录信息失效」。
+     * 101 是请求失败，与网络错误、超时、其它业务码一样只算刷新失败，不能推断成要重新登录。
      */
     val sessionExpired: Boolean get() = listOf(statsError, ruleError).any { error ->
-        error.startsWith("101:") || error.startsWith("102:") ||
+        error.startsWith("102:") ||
             error.contains("登录信息失效") || error.contains("请重新登录") ||
             error.contains("重新登录")
     }

@@ -319,8 +319,17 @@ private fun MainViewModel.fetchRealRouteAndStart(points: List<RoutePoint>, state
     }
 }
 
-private fun MainViewModel.startSimulationWithPoints(pointsToRun: List<RoutePoint>, state: AppState) {
+private fun MainViewModel.startSimulationWithPoints(
+    pointsToRun: List<RoutePoint>,
+    state: AppState,
+    targetKm: Double = 0.0
+) {
     val startPoint = pointsToRun.first()
+    // 一键跑/批量跑传入账号目标公里：饱和目标取 1.5×，与宿主 LepaoAutoStop 的打卡续跑上限对齐，
+    // 让打卡不齐时模拟仍能继续移动到 1.5× 而不是在目标处冻死。手动模拟 targetKm=0 → 清快照，
+    // ConfigManager 回退到面板 lepao_auto_stop_km，避免继承上一次自动化的陈旧目标。
+    com.kdzw8p.mqa.v71f.data.state.SpoofingState.targetDistanceM =
+        if (targetKm > 0.0) targetKm * 1000.0 * 1.5 else 0.0
 
     _uiState.update {
         it.copy(
@@ -385,18 +394,20 @@ private fun MainViewModel.startSimulationWithPoints(pointsToRun: List<RoutePoint
 
 /** 停止路线模拟，重置所有状态 */
 
-/** 一键跑/批量跑：总是从路线起点重开，不复用上次剩余进度。 */
-internal fun MainViewModel.startRouteFromBeginning() {
+/** 一键跑/批量跑：总是从路线起点重开，不复用上次剩余进度。
+ *  targetKm/account 由编排器按当前账号传入；手动调用缺省时回退到激活账号、不设饱和目标。 */
+internal fun MainViewModel.startRouteFromBeginning(targetKm: Double = 0.0, account: String = "") {
     val points = _uiState.value.routePoints
     if (points.size >= 2) {
-        // 最低均速按账号性别在开始前快照一次，随配置下发到宿主；中途改设置不影响本次
-        com.kdzw8p.mqa.v71f.data.state.SpoofingState.minPaceSecPerKm =
-            minPaceSecFor(settingsRepository.lepaoActiveAccount)
+        // 最低均速按账号性别在开始前快照一次，随配置下发到宿主；中途改设置不影响本次。
+        // 用编排器传入的账号而非 lepaoActiveAccount：切号异步提交前 activeAccount 可能还是旧账号。
+        val paceAccount = account.ifBlank { settingsRepository.lepaoActiveAccount }
+        com.kdzw8p.mqa.v71f.data.state.SpoofingState.minPaceSecPerKm = minPaceSecFor(paceAccount)
         // 记住这条路线：批量跑每号结束会清画布，重启后画布也是空的，靠它恢复。
         settingsRepository.lepaoLastRouteJson = points.joinToString(",", "[", "]") {
             "{\"lat\":${it.lat},\"lng\":${it.lng}}"
         }
-        startSimulationWithPoints(points, _uiState.value)
+        startSimulationWithPoints(points, _uiState.value, targetKm)
     }
 }
 
@@ -412,6 +423,8 @@ internal fun MainViewModel.cancelRoutePlanning() {
 
 internal fun MainViewModel.stopRoutePlanning() {
     settingsRepository.isSpoofingActive = false
+    // 清掉自动化会话的饱和目标快照，避免下一次手动模拟继承陈旧目标
+    com.kdzw8p.mqa.v71f.data.state.SpoofingState.targetDistanceM = 0.0
     locationSyncJob?.cancel()
     locationSyncJob = null
     motionController.onStopped()
